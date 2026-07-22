@@ -9,10 +9,39 @@ Adapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+import functools
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+
+# -----------------------------------------------------------------------------
+# torch.compile is unsupported on PPU (inductor generates CUDA kernels).
+# Use a lazy wrapper that defers the PPU check until first call to avoid
+# import-time issues with CUDA not being fully initialized.
+def _maybe_compile(fn):
+    """torch.compile on NVIDIA, lazy pass-through on PPU."""
+    compiled = None
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal compiled
+        if compiled is None:
+            # Lazy: check PPU on first call (CUDA is initialized by then)
+            if not torch.cuda.is_available():
+                compiled = fn  # no CUDA at all, just use eager
+            else:
+                try:
+                    is_ppu = "ppu" in torch.cuda.get_device_name(0).lower()
+                except Exception:
+                    is_ppu = False
+                if is_ppu:
+                    compiled = fn  # PPU: skip torch.compile
+                else:
+                    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+        return compiled(*args, **kwargs)
+
+    return wrapper
 
 # -----------------------------------------------------------------------------
 """
@@ -20,7 +49,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -108,7 +137,7 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters

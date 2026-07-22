@@ -8,8 +8,8 @@ Example tasks: MMLU, ARC-Easy, ARC-Challenge, GSM8K, HumanEval, SmolTalk.
 import os
 import json
 import random
+import time
 import urllib.request
-
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -42,6 +42,20 @@ class HubDataset:
         return row
 
 
+def _hf_request(url, max_retries=3):
+    """Make an HTTP request to HuggingFace (or mirror) with the required User-Agent header.
+    Retries on transient errors (rate limiting, timeouts) with exponential backoff."""
+    req = urllib.request.Request(url, headers={"User-Agent": "nanochat"})
+    for attempt in range(max_retries):
+        try:
+            return urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+
+
 def load_hub_dataset(repo_id, subset="default", split="train"):
     """
     Minimal stand-in for HuggingFace datasets.load_dataset(repo_id, subset, split=split).
@@ -60,15 +74,20 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
             # only a single rank acquires the lock and downloads, the others block
             # here and then skip the download because they recheck the manifest
             if not os.path.exists(manifest_path):
-                listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
-                with urllib.request.urlopen(listing_url) as response:
-                    shard_urls = json.loads(response.read())
+                hf_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+                listing_url = f"{hf_endpoint}/api/datasets/{repo_id}/parquet/{subset}/{split}"
+                shard_urls = json.loads(_hf_request(listing_url).read())
                 filenames = []
                 for shard_index, shard_url in enumerate(shard_urls):
+                    # Rewrite shard URLs to use the mirror endpoint.
+                    # The API returns URLs like:
+                    #   https://huggingface.co/api/datasets/{repo}/parquet/{subset}/{split}/{idx}.parquet
+                    # Keep the path as-is and just swap the host to the mirror.
+                    if hf_endpoint and hf_endpoint != "https://huggingface.co":
+                        shard_url = shard_url.replace("https://huggingface.co", hf_endpoint, 1)
                     filename = f"{shard_index:05d}.parquet"
                     print(f"Downloading {shard_url} ...")
-                    with urllib.request.urlopen(shard_url) as response:
-                        content = response.read()
+                    content = _hf_request(shard_url).read()
                     with open(os.path.join(shards_dir, filename), "wb") as f:
                         f.write(content)
                     filenames.append(filename)

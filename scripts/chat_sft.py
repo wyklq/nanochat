@@ -16,12 +16,12 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized, is_ppu
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import HAS_FA3, USE_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -87,8 +87,15 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+if USE_FA3:
+    print0("Using Flash Attention 3: efficient, new and awesome.")
+else:
+    print0("!" * 80)
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    else:
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+    print0("!" * 80)
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -115,7 +122,9 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if is_ppu():
+    print0("NOTE: PPU detected — skipping torch.compile (inductor not supported on PPU)")
+model = torch.compile(model, dynamic=False) if not is_ppu() else model
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -135,16 +144,67 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
+# CRITICAL: The AdamW buffers for large params use reduce_scatter and are sized
+# per rank based on the DDP world_size (each rank owns 1/world_size of the state).
+# If SFT world_size differs from base world_size, the buffer shapes will mismatch
+# and cause a crash during optimizer.step(). We detect this by inferring the base
+# world_size from the checkpoint's Muon momentum buffer and comparing.
 base_dir = get_base_dir()
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        # Infer base world_size from checkpoint to detect incompatibility.
+        # AdamW buffers for large params use reduce_scatter and are sized per rank
+        # (each rank owns 1/world_size of the state). If SFT world_size differs from
+        # base world_size, the buffer shapes will mismatch and crash during step().
+        # Muon momentum buffers use shape (chunk_size, *param_shape) where
+        # chunk_size = ceil(num_muon_params / world_size).
+        import math
+        actual_num_muon_params = sum(len(pg["params"]) for pg in optimizer.param_groups if pg.get("kind") == "muon")
+        try:
+            # Find the chunk_size from any momentum_buffer in the checkpoint state.
+            ckpt_chunk_size = None
+            for state_entry in optimizer_data.get("state", {}).values():
+                if "momentum_buffer" in state_entry:
+                    ckpt_chunk_size = state_entry["momentum_buffer"].shape[0]
+                    break
+            # Checkpoint's num_muon_params = ckpt_chunk_size (since each rank only stores
+            # its own params, and chunk_size = ceil(num_params_on_rank / 1)).
+            # But actually, for single-rank checkpoints the chunk_size equals num_params.
+            # For multi-rank checkpoints, chunk_size = ceil(num_params_on_rank / 1) = num_params_on_rank.
+            # The total num_params across all ranks = ckpt_chunk_size * base_world_size.
+            # Since we don't know base_world_size, we check:
+            # if ckpt_chunk_size != actual_num_muon_params, world_size differs.
+            if ckpt_chunk_size is not None and actual_num_muon_params > 0:
+                # Handle both cases: checkpoint may have same or different num_params
+                if ckpt_chunk_size != actual_num_muon_params:
+                    base_world_size_inferred = "different"
+                else:
+                    base_world_size_inferred = "same"
+            else:
+                base_world_size_inferred = "unknown"
+        except Exception:
+            base_world_size_inferred = "unknown"
+
+        if base_world_size_inferred == "different":
+            print0(f"WARNING: base optimizer checkpoint has incompatible buffer shapes "
+                   f"(chunk_size={ckpt_chunk_size} vs {actual_num_muon_params} muon params). "
+                   f"Skipping optimizer state load.")
+        elif base_world_size_inferred == "unknown":
+            print0("WARNING: Could not verify optimizer checkpoint compatibility. "
+                   f"Starting with fresh optimizer (momentum buffers will warm up during training).")
+        else:
+            try:
+                base_lrs = [group["lr"] for group in optimizer.param_groups]
+                optimizer.load_state_dict(optimizer_data)
+                del optimizer_data
+                for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                    group["lr"] = base_lr
+                print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+            except (RuntimeError, KeyError) as e:
+                del optimizer_data
+                print0(f"WARNING: Could not load optimizer state from pretrained checkpoint ({type(e).__name__}: {e})")
+                print0("Starting with fresh optimizer (momentum buffers will warm up during training)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 

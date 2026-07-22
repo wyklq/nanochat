@@ -148,6 +148,20 @@ def is_ddp_initialized() -> bool:
     """
     return dist.is_available() and dist.is_initialized()
 
+
+def is_ppu() -> bool:
+    """
+    Return True if running on a PPU (e.g. Alibaba PPU-ZW810E).
+    Used to gate features that are incompatible with PPU (e.g. torch.compile).
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return "ppu" in torch.cuda.get_device_name(0).lower()
+    except Exception:
+        return False
+
+
 def get_dist_info():
     if is_ddp_requested():
         # We rely on torchrun's env to decide if we SHOULD init.
@@ -261,6 +275,9 @@ def get_peak_flops(device_name: str) -> float:
         (["mi300a"], 980.6e12),
         (["mi250x"], 383e12),
         (["mi250"], 362.1e12),
+        # Alibaba PPU
+        (["zw810e"], 123e12),
+        (["ppu"], 123e12),
         # Consumer RTX
         (["5090"], 209.5e12),
         (["4090"], 165.2e12),

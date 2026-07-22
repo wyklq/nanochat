@@ -15,23 +15,40 @@ Usage (drop-in replacement for FA3):
 """
 import torch
 import torch.nn.functional as F
+import os
+import sys
+
+# Prepend PPU-native FA3 path (installed in ~/.local/ outside venv)
+sys.path.insert(0, os.path.expanduser("~/.local/lib/python3.12/site-packages"))
 
 
 # =============================================================================
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
 def _load_flash_attention_3():
-    """Try to load Flash Attention 3."""
+    """Try to load Flash Attention 3.
+
+    Priority:
+    1. `flash_attn_interface` — PPU-native FA3 package (e.g. flash-attn-3 PPU wheel)
+    2. `kernels` HuggingFace download — original FA3 path for NVIDIA GPUs
+    3. `flash_attn` — standard flash-attn (FA2) as last resort
+    """
     if not torch.cuda.is_available():
         return None
+
+    # --- Priority 1: PPU-native flash_attn_interface ---
+    try:
+        import flash_attn_interface
+        return flash_attn_interface
+    except Exception:
+        pass
+
+    # --- Priority 2: kernels HuggingFace download (NVIDIA GPUs) ---
     try:
         major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
-        # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
-        # The varunneal kernel obtains better results for H100/Hopper
         if major == 9:
             hf_kernel = "varunneal/flash-attention-3"
             return get_kernel(hf_kernel).flash_attn_interface
@@ -39,11 +56,17 @@ def _load_flash_attention_3():
             hf_kernel = "kernels-community/flash-attn3"
             if has_kernel(hf_kernel):
                 return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
-
     except Exception:
-        return None
+        pass
+
+    # --- Priority 3: standard flash_attn (FA2 API-compatible) ---
+    try:
+        import flash_attn
+        return flash_attn
+    except Exception:
+        pass
+
+    return None
 
 
 _fa3 = _load_flash_attention_3()
