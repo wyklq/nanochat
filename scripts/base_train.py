@@ -157,9 +157,13 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
+    if is_ddp_initialized():
+        dist.barrier()
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+    if is_ddp_initialized():
+        dist.barrier()
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -479,6 +483,8 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if is_ddp_initialized():
+            dist.barrier()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -492,6 +498,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
+                "distributed_world_size": ddp_world_size,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -501,6 +508,8 @@ while True:
             },
             rank=ddp_rank,
         )
+        if is_ddp_initialized():
+            dist.barrier()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:

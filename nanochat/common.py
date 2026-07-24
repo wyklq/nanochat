@@ -214,6 +214,15 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+        logger.info(
+            "Distributed initialization complete: rank=%d local_rank=%d world_size=%d device=%s master=%s:%s",
+            ddp_rank,
+            ddp_local_rank,
+            ddp_world_size,
+            device,
+            os.environ.get("MASTER_ADDR", "<unset>"),
+            os.environ.get("MASTER_PORT", "<unset>"),
+        )
     else:
         device = torch.device(device_type) # mps|cpu
 
